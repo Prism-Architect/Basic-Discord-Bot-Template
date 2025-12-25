@@ -1,0 +1,10 @@
+[project]
+name = "agent-bot-shell"
+version = "0.1.0"
+description = "Cloneable Discord bot shell with persona + modular behaviors"
+requires-python = ">=3.11"
+dependencies = [
+  "discord-py>=2.6.4",
+  "openai>=2.9.0",
+  "asyncpg>=0.29.0",
+]
