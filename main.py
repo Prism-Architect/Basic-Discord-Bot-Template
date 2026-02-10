@@ -715,6 +715,26 @@ async def cmd_unwatch(ctx):
         await conn.execute("DELETE FROM watched_channels WHERE channel_id = $1", channel_id)
     await ctx.reply(PERSONA.watch_off_message)
 
+@bot.command(name="state")
+async def cmd_state(ctx):
+    if OWNER_ID and ctx.author.id != OWNER_ID:
+        return
+
+    channel_id = str(ctx.channel.id)
+    watched = await is_channel_watched(channel_id)
+
+    msg = (
+        f"STATE\n"
+        f"- watched_channel: {watched}\n"
+        f"- model_main: {MODEL_MAIN}\n"
+        f"- model_side: {MODEL_SIDE}\n"
+        f"- context_messages: {len(get_context_messages(channel_id, str(ctx.author.id)))}\n"
+        f"- random_chance: {PERSONA.random_response_chance}\n"
+        f"- images_enabled: {ENABLE_IMAGES}\n"
+    )
+
+    await ctx.reply(f"```{msg}```")
+
 # ============================================================
 # Run
 # ============================================================
