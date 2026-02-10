@@ -13,7 +13,7 @@ import asyncpg
 from openai import AsyncOpenAI
 
 # ============================================================
-# ENGINE CONFIG (boring)
+# ENGINE CONFIG
 # ============================================================
 
 INSTANCE_ID = os.getenv("INSTANCE_ID") or socket.gethostname()[:8]
@@ -46,6 +46,10 @@ DISCORD_REPLY_LIMIT = int(os.getenv("DISCORD_REPLY_LIMIT", "1800"))
 # Context memory
 MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", "8"))
 CONTEXT_TIMEOUT_MINUTES = int(os.getenv("CONTEXT_TIMEOUT_MINUTES", "10"))
+
+# Response handling
+AGGREGATION_WINDOW_SECONDS = 2.0
+_pending_responses = {}
 
 # Feature flags
 ENABLE_IMAGES = os.getenv("ENABLE_IMAGES", "1") == "1"
@@ -126,7 +130,7 @@ Keep responses coherent and within the token budget. Never cut off mid-sentence.
 )
 
 # ============================================================
-# Discord bot setup (boring)
+# Discord bot setup
 # ============================================================
 
 intents = discord.Intents.default()
@@ -143,7 +147,7 @@ def log(msg: str):
         print(f"[{INSTANCE_ID}] {msg}")
 
 # ============================================================
-# Database (boring, per-bot DB)
+# Database
 # ============================================================
 
 db_pool: asyncpg.Pool | None = None
@@ -239,7 +243,7 @@ async def migrate_db():
             """)
 
 # ============================================================
-# In-memory context memory (boring)
+# In-memory context memory
 # ============================================================
 
 conversation_memory = defaultdict(list)
@@ -266,7 +270,7 @@ def get_context_messages(channel_id: str, user_id: str):
     return [{"role": role, "content": content} for _, role, content in conversation_memory[key]]
 
 # ============================================================
-# Discord transport helpers (boring)
+# Discord transport helpers
 # ============================================================
 
 def clamp_discord(text: str, limit: int = DISCORD_REPLY_LIMIT) -> str:
@@ -320,7 +324,7 @@ async def send_parts(message: discord.Message, parts: list[str]):
         await message.channel.send(p)
 
 # ============================================================
-# LLM utilities (boring)
+# LLM utilities
 # ============================================================
 
 async def call_chat(model: str, messages, max_tokens: int, temperature: float):
@@ -349,8 +353,57 @@ async def generate_main_reply(messages) -> str:
 
     return text
 
+def local_should_consider_responding(message: discord.Message, text: str) -> bool:
+    # Ignore very short messages
+    if len(text.strip()) < 3:
+        return False
+
+    # Ignore obvious reactions
+    if text.strip() in {"lol", "lmao", "ok", "okay", "👍", "😂"}:
+        return False
+
+    # Prefer questions, mentions, replies
+    if "?" in text:
+        return True
+
+    if message.reference is not None:
+        return True
+
+    # Soft heuristic: longer messages are more likely worth responding to
+    if len(text) > 80:
+        return True
+
+    return False
+
+async def queue_aggregated_response(message, user_message, image_urls):
+    key = (message.channel.id, message.author.id)
+
+    if key in _pending_responses:
+        task, buffer = _pending_responses[key]
+        buffer["text"] += "\n" + user_message
+        buffer["images"].extend(image_urls or [])
+        task.cancel()
+    else:
+        buffer = {"text": user_message, "images": image_urls or []}
+
+    async def delayed():
+        try:
+            await asyncio.sleep(AGGREGATION_WINDOW_SECONDS)
+            await handle_agent_response(
+                message,
+                buffer["text"],
+                buffer["images"][:3],
+            )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _pending_responses.pop(key, None)
+
+    task = asyncio.create_task(delayed())
+    _pending_responses[key] = (task, buffer)
+
 # ============================================================
-# Optional modules (boring, persona-flavored)
+# Optional modules (persona-flavored)
 # ============================================================
 
 WATCHED_CHANNEL_IDS: set[str] = set()
@@ -529,7 +582,7 @@ async def build_system_prompt(user_id: str, server_id: str | None, speaker_id: s
     return PERSONA.system_prompt_template
 
 # ============================================================
-# Core handler (boring)
+# Core handler
 # ============================================================
 
 async def handle_agent_response(message: discord.Message, user_message: str, image_urls: list[str] | None = None):
@@ -579,7 +632,7 @@ async def handle_agent_response(message: discord.Message, user_message: str, ima
             await message.channel.send(PERSONA.error_message)
 
 # ============================================================
-# Events + commands (boring)
+# Events + commands
 # ============================================================
 
 @bot.event
@@ -609,11 +662,7 @@ async def on_message(message: discord.Message):
             .replace(f"<@!{bot.user.id}>", "")
             .strip()
         )
-        await handle_agent_response(
-            message,
-            user_message or ("Describe this." if image_urls else "Speak."),
-            image_urls,
-        )
+        await queue_aggregated_response(message, user_message, image_urls)
         return
 
     # Watched channel logic
@@ -623,17 +672,19 @@ async def on_message(message: discord.Message):
 
         # Direct trigger => always
         if contains_direct_trigger(user_message):
-            await handle_agent_response(message, user_message, image_urls)
+            await queue_aggregated_response(message, user_message, image_urls)
             return
 
         # Soft/random => maybe
         has_soft = contains_soft_trigger(user_message)
         random_roll = random.random() < PERSONA.random_response_chance
         if has_soft or random_roll:
-            if await should_agent_respond(user_message):
-                await handle_agent_response(message, user_message, image_urls)
-                return
+            if not local_should_consider_responding(message, user_message):
+        return
 
+            if await should_agent_respond(user_message):
+                await queue_aggregated_response(message, user_message, image_urls)
+                return
     await bot.process_commands(message)
 
 @bot.command(name="ask")
